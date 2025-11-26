@@ -23,14 +23,15 @@
     │   │   ├── train.py
     │   │   └── play.py
     ├── source/
-    │   └── Robotic/
-    │       ├── tasks/
-    │       │   └── direct/
-    │       │       └── robotic/
-    │       │           ├── robotic_env.py     (如何跟環境互動，獎勵訊號)
-    │       │           └── robotic_env_cfg.py (初始要用到的一些參數值)
-    │       └── robots/
-    │           └── RS_M90E7A/                 (左手臂的配置檔，目前是用速度控制)
+    |   └── Robotic/
+    │       └── Robotic/
+    │           ├── tasks/
+    │           │   └── direct/
+    │           │       └── robotic/
+    │           │           ├── robotic_env.py     (如何跟環境互動，獎勵訊號)
+    │           │           └── robotic_env_cfg.py (初始要用到的一些參數值)
+    │           └── robots/
+    │               └── RS_M90E7A.py                 (左手臂的配置檔，目前是用速度控制)
     ├── Fan.usd
     ├── Plate.usd
     ├── Rack.usd
