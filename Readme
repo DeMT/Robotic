@@ -1,0 +1,13 @@
+python scripts/rl_games/train.py --task=Template-Robotic-Direct-v0 \
+  agent.params.config.horizon_length=128 \
+  agent.params.config.minibatch_size=256 \
+  --video \
+  --num_envs=100
+
+python scripts/rl_games/train.py --task=Template-Robotic-Direct-v0 \
+  agent.params.config.horizon_length=128 \
+  agent.params.config.minibatch_size=128 \
+  --video \
+  --num_envs=1
+  
+python scripts/rl_games/play.py --task=Template-Robotic-Direct-v0 --checkpoint=
