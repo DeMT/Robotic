@@ -270,7 +270,7 @@ class PoseMonitor:
         Returns:
             Array of arm joint positions (7-DOF).
         """
-        return self.robot_observer.get_arm_joint_positions()
+        return self.robot_observer.get_arm_joint_positions().detach().cpu().numpy()
 
     def get_gripper_joint_positions(self) -> np.ndarray:
         """

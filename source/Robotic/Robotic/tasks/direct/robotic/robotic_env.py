@@ -22,7 +22,6 @@ from .robotic_env_cfg import RoboticEnvCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 import isaaclab.utils.math as math_utils
-from .pose_monitor import PoseMonitor
 
 from gym import spaces
 import numpy as np
@@ -42,22 +41,10 @@ class RoboticEnv(DirectRLEnv):
         high = np.array([ 1.0]*7 + [ 0.2], dtype=np.float32)
         self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
         
-        # ---- EE 索引：多候選 + fallback 到兩指中點 ----
-        self._ee_mode = None            # "body" 或 "fingers"
-        self.ee_body_idx = None
-        self._finger_idx_pair = None
-
-        names = self.robot.body_names 
-
-        if self.cfg.ee_body_name in names:
-            self.ee_body_idx = names.index(self.cfg.ee_body_name)
-            self._ee_mode = "body"
-            print(f"[EE] using rigid body: {self.cfg.ee_body_name} (idx={self.ee_body_idx})")
-        else:
-            raise RuntimeError(
-                f"指定的 ee_body_name='{self.cfg.ee_body_name}' 不存在。"
-                f"可用的剛體名稱有：{', '.join(names)}"
-            )
+        names = self.robot.body_names
+        print("Robot bodies:", names)
+        self._finger_idx_pair = (names.index("grasp_3"), names.index("grasp_4"))
+        print(f"[EE] using fingers midpoint: grasp_3, grasp_4")
         
         self._init_tensors_once()
 
@@ -118,19 +105,6 @@ class RoboticEnv(DirectRLEnv):
 
         self.jacobians = None
 
-        self.monitors = []
-        for i in range(self.num_envs):
-            m = PoseMonitor.create_default(
-                robot_prim_path=f"/World/envs/env_{i}/Robot",
-                fan_prim_path=f"/World/envs/env_{i}/fan",
-                ground_truth_prim_path=f"/World/envs/env_{i}/rack",
-                robot_description_path=self.cfg.robot_description_path,
-                urdf_path=self.cfg.robot_urdf_path,
-            )
-            self.monitors.append(m)
-        
-        self._monitor_inited = False
-
     def _init_tensors_once(self):
         self.prev_actions = torch.zeros((self.num_envs, self.action_space.shape[0]), device=self.device)
         self.prev_xy_dist = torch.zeros((self.num_envs,), device=self.device)
@@ -141,20 +115,16 @@ class RoboticEnv(DirectRLEnv):
     
     def _compute_intermediate(self):
         # EE pose
-        if self._ee_mode == "body":
-            self.ee_pos  = self.robot.data.body_pos_w[:, self.ee_body_idx] - self.scene.env_origins
-            self.ee_quat = self.robot.data.body_quat_w[:, self.ee_body_idx]
-        else:  # "fingers" -> 用兩指中點
-            i3, i4 = self._finger_idx_pair
-            p3 = self.robot.data.body_pos_w[:, i3]
-            p4 = self.robot.data.body_pos_w[:, i4]
-            self.ee_pos = 0.5 * (p3 + p4) - self.scene.env_origins
-            # 四元數可用其中一指或 gripper_base_2（若存在）代表
-            if "gripper_base_2" in self.robot.body_names:
-                ib = self.robot.body_names.index("gripper_base_2")
-                self.ee_quat = self.robot.data.body_quat_w[:, ib]
-            else:
-                self.ee_quat = self.robot.data.body_quat_w[:, i3]
+        i3, i4 = self._finger_idx_pair
+        p3 = self.robot.data.body_pos_w[:, i3]
+        p4 = self.robot.data.body_pos_w[:, i4]
+        self.ee_pos = 0.5 * (p3 + p4) - self.scene.env_origins
+        # 四元數可用其中一指或 gripper_base_2（若存在）代表
+        if "TF_1" in self.robot.body_names:
+            itf = self.robot.body_names.index("TF_1")
+            self.ee_quat = self.robot.data.body_quat_w[:, itf]
+        else:
+            self.ee_quat = self.robot.data.body_quat_w[:, i3]
 
         # fan pose 
         self.fan_pos  = self.fan.data.root_pos_w - self.scene.env_origins
@@ -243,27 +213,26 @@ class RoboticEnv(DirectRLEnv):
         r_reach = -dist                            # 距離越近獎勵越高（越負越不好）
 
         # === 2) 夾緊成功 ===
-        close_ok = (self.gripper_gap < self.cfg.grasp_width_close_threshold)
-        near_ok  = (dist < self.cfg.align_thresh)
-        r_grasp  = (close_ok & near_ok).float()
+        # close_ok = (self.gripper_gap < self.cfg.grasp_width_close_threshold)
+        # near_ok  = (dist < self.cfg.align_thresh)
+        # r_grasp  = (close_ok & near_ok).float()
 
-        # === 3) 抬起成功 ===
-        lift_ok = (self.fan_pos[:, 2] > (self.cfg.plate_spawn_base[2] + self.cfg.lift_height_thresh))
-        r_lift  = lift_ok.float() * 3.0
+        # # === 3) 抬起成功 ===
+        # lift_ok = (self.fan_pos[:, 2] > (self.cfg.plate_spawn_base[2] + self.cfg.lift_height_thresh))
+        # r_lift  = lift_ok.float() * 3.0
 
-        # === 動作成本 ===
-        act_pen_arm  = -0.005 * torch.linalg.norm(self.actions[:, :7], dim=-1)
-        g_speed      = self.actions[:, 7].abs()
-        far_mask     = (dist > 0.08).float()
-        act_pen_grip = -0.05 * g_speed * far_mask
+        # # === 動作成本 ===
+        # act_pen_arm  = -0.005 * torch.linalg.norm(self.actions[:, :7], dim=-1)
+        # g_speed      = self.actions[:, 7].abs()
+        # far_mask     = (dist > 0.08).float()
+        # act_pen_grip = -0.05 * g_speed * far_mask
 
         # === 總獎勵 ===
         # rew = (1.0*r_reach + 0.5*r_grasp + 1.0*r_lift + act_pen_arm + act_pen_grip)
-        rew = r_reach + r_grasp + r_lift
+        rew = r_reach
         # print(r_reach, r_grasp, r_lift)
         # === 狀態記錄 ===
         self.prev_actions = self.actions.clone()
-        self.prev_xy_dist = dist
 
         return rew
 
@@ -277,14 +246,10 @@ class RoboticEnv(DirectRLEnv):
         return done, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
+        
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
-
-        if not getattr(self, "_monitor_inited", False):
-            for m in self.monitors:
-                m.initialize()
-            self._monitor_inited = True
 
         # set the root state for the reset envs
         default_root_state = self.robot.data.default_root_state[env_ids]
@@ -319,24 +284,3 @@ class RoboticEnv(DirectRLEnv):
         self._compute_intermediate()
         rel = (self.ee_pos - self.fan_pos)
         self.prev_xy_dist[env_ids] = torch.linalg.norm(rel[env_ids, :2], dim=-1)
-
-@torch.jit.script
-def compute_rewards(
-    rew_scale_alive: float,
-    rew_scale_terminated: float,
-    rew_scale_pole_pos: float,
-    rew_scale_cart_vel: float,
-    rew_scale_pole_vel: float,
-    pole_pos: torch.Tensor,
-    pole_vel: torch.Tensor,
-    cart_pos: torch.Tensor,
-    cart_vel: torch.Tensor,
-    reset_terminated: torch.Tensor,
-):
-    rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
-    rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_pole_pos = rew_scale_pole_pos * torch.sum(torch.square(pole_pos).unsqueeze(dim=1), dim=-1)
-    rew_cart_vel = rew_scale_cart_vel * torch.sum(torch.abs(cart_vel).unsqueeze(dim=1), dim=-1)
-    rew_pole_vel = rew_scale_pole_vel * torch.sum(torch.abs(pole_vel).unsqueeze(dim=1), dim=-1)
-    total_reward = rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
-    return total_reward

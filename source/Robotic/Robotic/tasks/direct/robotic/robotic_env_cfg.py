@@ -35,7 +35,6 @@ class RoboticEnvCfg(DirectRLEnvCfg):
         'Revolute7','Revolute6','Revolute5','Revolute4','Revolute3','Revolute2','Revolute1', # Arm
         'Slider9','Slider10'
     ]    
-    ee_body_name: str = "link6_1"
     # gripper 幾何（粗估，訓練用）
     gripper_half_thickness: float = 0.01    # 手指厚度的一半（碰撞近似用）
     grasp_width_close_threshold: float = 0.005  # 視為「夾緊」的寬度（m）
@@ -47,9 +46,9 @@ class RoboticEnvCfg(DirectRLEnvCfg):
     robot_description_path: str = str(ASSET_DIR / "robot_description.yaml")
     robot_urdf_path: str = str(ASSET_DIR / "RS-M90E7A.urdf")
     
-    fan_spawn_base: tuple[float,float,float] = (0.0, -0.7, 0.0)
-    plate_spawn_base: tuple[float,float,float] = (0.0, -0.7, 0.0)
-    rack_spawn_base: tuple[float,float,float]  = (0.0, -0.7, 0.0)
+    fan_spawn_base: tuple[float,float,float] = (-0.3, -0.8, 0.0)
+    plate_spawn_base: tuple[float,float,float] = (-0.3, -0.8, 0.0)
+    rack_spawn_base: tuple[float,float,float]  = (-0.3, -0.8, 0.0)
 
     # 隨機擾動
     fan_pos_noise_xyz: tuple[float,float,float] = (0.00, 0.00, 0.0) # XY 亂數擺放

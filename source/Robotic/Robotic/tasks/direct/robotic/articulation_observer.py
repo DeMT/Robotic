@@ -298,7 +298,14 @@ class ArticulationObserver:
         if self._arm_joint_indices is None:
             raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
         all_positions = self._articulation.get_joint_positions()
-        return np.array([all_positions[i] for i in self._arm_joint_indices], dtype=float)
+        # return np.array([all_positions[i] for i in self._arm_joint_indices], dtype=float)
+        return (
+            all_positions[self._arm_joint_indices]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(float)
+        )
 
     def get_arm_joint_velocities(self) -> np.ndarray:
         """Get arm joint velocities (7-DOF)."""
@@ -434,4 +441,4 @@ class ArticulationObserver:
         Returns:
             Tuple of (position, orientation) where orientation is quaternion (wxyz).
         """
-        return self._articulation.get_world_pose()
+        return self._articulation.get_world_pose().detach().cpu().numpy()

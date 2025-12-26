@@ -27,7 +27,7 @@ RS_M90E7A_CONFIG = ArticulationCfg(
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.0),
         # rot=(1.0, 0.0, 0.0, 0.0),
-        rot=(math.cos(math.radians(-15)/2), 0.0, 0.0, math.sin(math.radians(-15)/2)),
+        rot=(math.cos(math.radians(-25)/2), 0.0, 0.0, math.sin(math.radians(-25)/2)),
         joint_pos={
             # 7 軸
             "Revolute1": 0.0,

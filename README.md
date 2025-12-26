@@ -59,7 +59,9 @@
       agent.params.config.horizon_length=128 \
       agent.params.config.minibatch_size=256 \
       --video \
-      --num_envs=100
+      --video_length=1000 \
+      --num_envs=20 \
+      --max_iterations=500
 
 7. Play with checkpoint
     ```bash
