@@ -39,22 +39,23 @@
 
 
 5. Verify that the extension is correctly installed by:
-  
     - Listing the available tasks:
-
           Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
           (in the `scripts/list_envs.py` file) so that it can be listed.
 
+          <!-- Under the outermost Robotic/ directory -->
           # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
           python scripts/list_envs.py
 
     - Launch a random agent:
-
+          
+          <!-- Under the outermost Robotic/ directory -->
           # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
           python scripts/view_env.py
 
 6. Train an RL agent
     ```bash
+    <!-- Under the outermost Robotic/ directory -->
     python scripts/rl_games/train.py --task=Template-Robotic-Direct-v0 \
       agent.params.config.horizon_length=128 \
       agent.params.config.minibatch_size=256 \
