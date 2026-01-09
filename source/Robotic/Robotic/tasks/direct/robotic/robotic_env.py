@@ -71,6 +71,12 @@ class RoboticEnv(DirectRLEnv):
             num_envs=self.num_envs,
             device=self.device,
         )
+
+        self.touch_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+        self.episode_touch_count = torch.zeros((self.num_envs,), device=self.device, dtype=torch.int32)
+
+        self.total_episodes = 0
+        self.total_touches = 0
         
         # test
         print("dt =", self.cfg.sim.dt, "decimation =", self.cfg.decimation)
@@ -124,16 +130,16 @@ class RoboticEnv(DirectRLEnv):
         self.jacobians = None
 
         # monitor
-        self.monitor = []
-        for i in range(self.num_envs):
-            mon = PoseMonitor.create_default(
-                robot_prim_path=f"/World/envs/env_{i}/Robot/RS_M90E7A_Left",
-                fan_prim_path=f"/World/envs/env_{i}/fan",
-                ground_truth_prim_path=f"/World/envs/env_{i}/rack",
-            )
-            self.monitor.append(mon)
+        # self.monitor = []
+        # for i in range(self.num_envs):
+        #     mon = PoseMonitor.create_default(
+        #         robot_prim_path=f"/World/envs/env_{i}/Robot/RS_M90E7A_Left",
+        #         fan_prim_path=f"/World/envs/env_{i}/fan",
+        #         ground_truth_prim_path=f"/World/envs/env_{i}/rack",
+        #     )
+        #     self.monitor.append(mon)
         
-        self.monitor_initized = False
+        # self.monitor_initized = False
 
     def _init_tensors_once(self):
         self.prev_actions = torch.zeros((self.num_envs, self.action_space.shape[0]), device=self.device)
@@ -144,33 +150,38 @@ class RoboticEnv(DirectRLEnv):
         self.fan_quat= torch.zeros((self.num_envs, 4), device=self.device)
     
     def _compute_intermediate(self):
+        ## use fingers midpoint as EE
+        i3, i4 = self._finger_idx_pair
+        p3 = self.robot.data.body_pos_w[:, i3]
+        p4 = self.robot.data.body_pos_w[:, i4]
+        self.finger_pos = 0.5 * (p3 + p4) - self.scene.env_origins
         ## EE pose = TF_1
-        # itf = self.robot.body_names.index("TF_1")
-        # self.ee_pos  = self.robot.data.body_pos_w[:, itf] - self.scene.env_origins
-        # self.ee_quat = self.robot.data.body_quat_w[:, itf]
+        itf = self.robot.body_names.index("TF_1")
+        self.ee_pos  = self.robot.data.body_pos_w[:, itf] - self.scene.env_origins
+        self.ee_quat = self.robot.data.body_quat_w[:, itf]
 
         ## use monitor to get more accurate EE pos
         # ee_pose = monitor.get_end_effector_pose()
         # print(f"夾爪位置: {ee_pose.p}")      # 輸出: [x, y, z] 三維座標
         # print(f"夾爪姿態: {ee_pose.q}")      # 輸出: [w, x, y, z] 四元數
-        ee_p_list = []
-        ee_q_list = []
+        # ee_p_list = []
+        # ee_q_list = []
 
-        for mon in self.monitor:
-            pose = mon.get_end_effector_pose()   # PosePq
-            # pose.p: (3,)  pose.q: (4,)  (usually numpy or list)
-            ee_p_list.append(torch.as_tensor(pose.p, device=self.device, dtype=torch.float32))
-            ee_q_list.append(torch.as_tensor(pose.q, device=self.device, dtype=torch.float32))
+        # for mon in self.monitor:
+        #     pose = mon.get_end_effector_pose()   # PosePq
+        #     # pose.p: (3,)  pose.q: (4,)  (usually numpy or list)
+        #     ee_p_list.append(torch.as_tensor(pose.p, device=self.device, dtype=torch.float32))
+        #     ee_q_list.append(torch.as_tensor(pose.q, device=self.device, dtype=torch.float32))
 
-        ee_p = torch.stack(ee_p_list, dim=0)   # (N,3)
-        ee_q = torch.stack(ee_q_list, dim=0)   # (N,4)
+        # ee_p = torch.stack(ee_p_list, dim=0)   # (N,3)
+        # ee_q = torch.stack(ee_q_list, dim=0)   # (N,4)
 
-        # 如果 monitor 回來的是 world pose，你這裡照你原本做法轉成 env-local
-        self.ee_pos  = ee_p - self.scene.env_origins
-        self.ee_quat = ee_q
+        # # 如果 monitor 回來的是 world pose，你這裡照你原本做法轉成 env-local
+        # self.ee_pos  = ee_p - self.scene.env_origins
+        # self.ee_quat = ee_q
 
-        print("EE位置:", self.ee_pos)
-        print("EE四元數:", self.ee_quat)
+        # print("EE位置:", self.ee_pos)
+        # print("EE四元數:", self.ee_quat)
 
         self.fan_pos  = self.fan.data.root_pos_w - self.scene.env_origins
         self.fan_quat = self.fan.data.root_quat_w
@@ -180,6 +191,19 @@ class RoboticEnv(DirectRLEnv):
         jpos = self.robot.data.joint_pos
         self.gripper_gap = (jpos[:, idx10] - jpos[:, idx09]).abs()
 
+    def _check_touch(self) -> torch.Tensor:
+        # print(self.fan.data)
+        # contact = self.fan.data.net_contact_forces_w  # 常見欄位：(N, num_bodies?, 3) 或 (N, 3)
+        # # 只要 contact force 有非零就算接觸
+        # if contact.dim() == 3:
+        #     mag = torch.linalg.norm(contact, dim=-1).max(dim=-1).values  # (N,)
+        # else:
+        #     mag = torch.linalg.norm(contact, dim=-1)  # (N,)
+        # return mag > 1.0  # threshold 可調，先從 1N 起跳
+        touch = (torch.linalg.norm(self.finger_pos - self.fan_pos, dim=-1) < 0.15)
+
+        return touch
+    
     def _update_jacobian(self):
         # 1) EE body index (cache once is fine)
         if not hasattr(self, "_ee_body_idx"):
@@ -269,20 +293,21 @@ class RoboticEnv(DirectRLEnv):
 
         # === 1) 距離 ===
         ## use fingers midpoint as EE
-        i3, i4 = self._finger_idx_pair
-        p3 = self.robot.data.body_pos_w[:, i3]
-        p4 = self.robot.data.body_pos_w[:, i4]
-        finger_pos = 0.5 * (p3 + p4) - self.scene.env_origins
-        rel = finger_pos - self.fan_pos
-        # print("fingers-距離獎勵:", rel)
+        rel = self.finger_pos - self.fan_pos
+        r_reach = -torch.linalg.norm(rel, dim=-1)
 
         ## use monitor EE directly
-        r_reach_list = []
-        for mon in self.monitor:
-            error = mon.get_ee_to_fan_error()
-            r_reach_list.append(-torch.as_tensor(error.distance, device=self.device, dtype=torch.float32))
-        r_reach = torch.stack(r_reach_list, dim=0)   # (N,)
+        # r_reach_list = []
+        # for mon in self.monitor:
+        #     error = mon.get_ee_to_fan_error()
+        #     r_reach_list.append(-torch.as_tensor(error.distance, device=self.device, dtype=torch.float32))
+        # r_reach = torch.stack(r_reach_list, dim=0)   # (N,)
         # print("monitor-距離獎勵:", r_reach)
+
+        touch = self._check_touch()
+        newly_touch = touch & (~self.touch_buf)
+        r_touch = newly_touch.float() * 100.0 
+        self.touch_buf |= touch
 
         # === 2) 夾緊成功 ===
         # close_ok = (self.gripper_gap < self.cfg.grasp_width_close_threshold)
@@ -301,7 +326,7 @@ class RoboticEnv(DirectRLEnv):
 
         # === 總獎勵 ===
         # rew = (1.0*r_reach + 0.5*r_grasp + 1.0*r_lift + act_pen_arm + act_pen_grip)
-        rew = r_reach
+        rew = r_reach + r_touch
         # print(r_reach, r_grasp, r_lift)
         # === 狀態記錄 ===
         self.prev_actions = self.actions.clone()
@@ -313,7 +338,7 @@ class RoboticEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         # 可選：成功就提早終止（避免太長）
-        success = (self.fan_pos[:, 2] > (self.cfg.plate_spawn_base[2] + self.cfg.lift_height_thresh))
+        success = self.touch_buf.clone()
         done = time_out | success
         return done, time_out
 
@@ -323,11 +348,11 @@ class RoboticEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # initialize monitors
-        if not self.monitor_initized:
-            for mon in self.monitor:
-                mon.initialize()
-            print("PoseMonitor initialized.")
-            self.monitor_initized = True
+        # if not self.monitor_initized:
+        #     for mon in self.monitor:
+        #         mon.initialize()
+        #     print("PoseMonitor initialized.")
+        #     self.monitor_initized = True
 
         # set the root state for the reset envs
         default_root_state = self.robot.data.default_root_state[env_ids]
@@ -362,3 +387,25 @@ class RoboticEnv(DirectRLEnv):
         self._compute_intermediate()
         rel = (self.ee_pos - self.fan_pos)
         self.prev_xy_dist[env_ids] = torch.linalg.norm(rel[env_ids, :2], dim=-1)
+
+        ep_touch = self.touch_buf[env_ids].int()
+        self.episode_touch_count[env_ids] = ep_touch
+
+        # 更新全域統計（Python int）
+        self.total_episodes += int(len(env_ids))
+        self.total_touches += int(ep_touch.sum().item())
+
+        # reset success flag
+        self.touch_buf[env_ids] = False
+
+    def _get_infos(self) -> dict:
+        # success rate (global)
+        success_rate = 0.0 if self.total_episodes == 0 else (self.total_touches / self.total_episodes)
+
+        return {
+            "touch": self.touch_buf.clone(),  # per-env success this step
+            "episode_touch": self.episode_touch_count.clone(),  # per-env last episode
+            "touch_rate": success_rate,  # scalar
+            "total_episodes": self.total_episodes,
+            "total_touches": self.total_touches,
+        }
