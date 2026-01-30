@@ -79,8 +79,8 @@ class RoboticEnv(DirectRLEnv):
         self.total_touches = 0
 
         # ===== Grasp (holding) detection buffers =====
-        self.hold_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
-        self._hold_frame_count = torch.zeros((self.num_envs,), device=self.device, dtype=torch.int32)
+        self.grasp_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+        self._grasp_frame_count = torch.zeros((self.num_envs,), device=self.device, dtype=torch.int32)
 
         # ===== Grasp thresholds (mirror GraspDetectionConfig defaults) =====
         # Slider9 ~ +0.02, Slider10 ~ -0.02 when holding
@@ -92,7 +92,7 @@ class RoboticEnv(DirectRLEnv):
         self.grasp_zone_max_m = 0.03
 
         # consecutive frames to confirm holding
-        self.hold_confirm_frames = 3
+        self.grasp_confirm_frames = 3
         
         # test
         print("dt =", self.cfg.sim.dt, "decimation =", self.cfg.decimation)
@@ -130,8 +130,8 @@ class RoboticEnv(DirectRLEnv):
         # plate = sim_utils.UsdFileCfg(usd_path=self.cfg.plate_usd)
         # plate.func("/World/envs/env_.*/plate", plate, translation=self.cfg.plate_spawn_base)
 
-        # rack = sim_utils.UsdFileCfg(usd_path=self.cfg.rack_usd)
-        # rack.func("/World/envs/env_.*/rack", rack, translation=self.cfg.rack_spawn_base)
+        rack = sim_utils.UsdFileCfg(usd_path=self.cfg.rack_usd)
+        rack.func("/World/envs/env_.*/rack", rack, translation=self.cfg.rack_spawn_base)
 
         # clone and replicate
         self.scene.clone_environments(copy_from_source=True)
@@ -146,16 +146,16 @@ class RoboticEnv(DirectRLEnv):
         self.jacobians = None
 
         # monitor
-        # self.monitor = []
-        # for i in range(self.num_envs):
-        #     mon = PoseMonitor.create_default(
-        #         robot_prim_path=f"/World/envs/env_{i}/Robot/RS_M90E7A_Left",
-        #         fan_prim_path=f"/World/envs/env_{i}/fan",
-        #         ground_truth_prim_path=f"/World/envs/env_{i}/rack",
-        #     )
-        #     self.monitor.append(mon)
+        self.monitor = []
+        for i in range(self.num_envs):
+            mon = PoseMonitor.create_default(
+                robot_prim_path=f"/World/envs/env_{i}/Robot/RS_M90E7A_Left",
+                fan_prim_path=f"/World/envs/env_{i}/fan",
+                ground_truth_prim_path=f"/World/envs/env_{i}/rack",
+            )
+            self.monitor.append(mon)
         
-        # self.monitor_initized = False
+        self.monitor_initized = False
 
     def _init_tensors_once(self):
         self.prev_actions = torch.zeros((self.num_envs, self.action_space.shape[0]), device=self.device)
@@ -170,11 +170,12 @@ class RoboticEnv(DirectRLEnv):
         i3, i4 = self._finger_idx_pair
         p3 = self.robot.data.body_pos_w[:, i3]
         p4 = self.robot.data.body_pos_w[:, i4]
-        self.finger_pos = 0.5 * (p3 + p4) - self.scene.env_origins
-        ## EE pose = TF_1
-        itf = self.robot.body_names.index("TF_1")
-        self.ee_pos  = self.robot.data.body_pos_w[:, itf] - self.scene.env_origins
-        self.ee_quat = self.robot.data.body_quat_w[:, itf]
+        self.ee_pos = 0.5 * (p3 + p4) - self.scene.env_origins
+        self.ee_quat = self.robot.data.body_quat_w[:, i3]  # 任選一隻手指的四元數當 EE 四元數
+        ## use TF_1 as EE
+        # itf = self.robot.body_names.index("TF_1")
+        # self.ee_pos  = self.robot.data.body_pos_w[:, itf] - self.scene.env_origins
+        # self.ee_quat = self.robot.data.body_quat_w[:, itf]
 
         # print("TF_1 EE位置:", self.ee_pos)
         # print("手指中點位置:", self.finger_pos)
@@ -205,11 +206,11 @@ class RoboticEnv(DirectRLEnv):
         self.gripper_gap = (jpos[:, idx10] - jpos[:, idx09]).abs()
 
     def _check_touch(self) -> torch.Tensor:
-        touch = (torch.linalg.norm(self.finger_pos - self.fan_pos, dim=-1) < 0.15)
+        touch = (torch.linalg.norm(self.ee_pos - self.fan_pos, dim=-1) < 0.15)
 
         return touch
     
-    def _check_holding(self) -> torch.Tensor:
+    def _check_grasped(self) -> torch.Tensor:
         # --- (1) gripper closed check (symmetric range) ---
         idx10 = self.cfg.dof_names.index("Slider10")
         idx09 = self.cfg.dof_names.index("Slider9")
@@ -225,21 +226,27 @@ class RoboticEnv(DirectRLEnv):
         # --- (2) grasp zone check (distance to fan) ---
         # PoseMonitor uses EE-to-fan error distance; in your env you already use finger midpoint to reach,
         # so we'll use finger_pos to fan_pos for grasp-zone.
-        ee_dist = torch.linalg.norm(self.finger_pos - self.fan_pos, dim=-1)
+        ee_dist = torch.linalg.norm(self.ee_pos - self.fan_pos, dim=-1)
         is_in_zone = (ee_dist >= self.grasp_zone_min_m) & (ee_dist <= self.grasp_zone_max_m)
 
         # --- (3) frame-based confirmation ---
         candidate = is_closed & is_in_zone
-        self._hold_frame_count = torch.where(
+        self._grasp_frame_count = torch.where(
             candidate,
-            self._hold_frame_count + 1,
-            torch.zeros_like(self._hold_frame_count),
+            self._grasp_frame_count + 1,
+            torch.zeros_like(self._grasp_frame_count),
         )
-        confirmed = self._hold_frame_count >= int(self.hold_confirm_frames)
+        confirmed = self._grasp_frame_count >= int(self.grasp_confirm_frames)
 
-        self.hold_buf = confirmed
-        return self.hold_buf
+        self.grasp_buf = confirmed
+        return self.grasp_buf
 
+        # grasped_list = []
+        # for mon in self.monitor:
+        #     grasped = mon.is_holding_fan()
+        #     grasped_list.append(grasped)
+        # grasped_tensor = torch.as_tensor(grasped_list, device=self.device, dtype=torch.bool)
+        # return grasped_tensor
     
     def _update_jacobian(self):
         # 1) EE body index (cache once is fine)
@@ -324,21 +331,33 @@ class RoboticEnv(DirectRLEnv):
         self.cfg.observation_space = obs.shape[-1]  # 動態校正
 
         return {"policy": obs}
-
+    
     def _get_rewards(self) -> torch.Tensor:
         self._compute_intermediate()
 
         # === 1) 距離 ===
-        ## use fingers midpoint as EE
-        rel = self.finger_pos - self.fan_pos
+        rel = self.ee_pos - self.fan_pos
         r_reach = -torch.linalg.norm(rel, dim=-1)
+        # print("距離獎勵:", r_reach)
+
+        # === 角度 ===
+        # 用四元數差異來計算角度差異
+        q_diff = quat_mul(quat_conj(self.ee_quat), self.fan_quat)
+        angle_diff = 2.0 * torch.acos(
+            torch.clamp(q_diff[..., 0].abs(), max=1.0)
+        )
+        r_angle = -angle_diff
+        # print("角度獎勵:", r_angle)
 
         ## use monitor EE directly
-        # r_reach_list = []
-        # for mon in self.monitor:
-        #     error = mon.get_ee_to_fan_error()
-        #     r_reach_list.append(-torch.as_tensor(error.distance, device=self.device, dtype=torch.float32))
-        # r_reach = torch.stack(r_reach_list, dim=0)   # (N,)
+        r_reach_list = []
+        for mon in self.monitor:
+            error = mon.get_ee_to_fan_error()
+            r_reach_list.append(error.distance)
+            print("Monitor error distance:", error.distance)
+            # print(f"Monitor error position: {error.position_error}")
+        r_reach_tensor = torch.as_tensor(r_reach_list, device=self.device, dtype=torch.float32)
+        r_reach = -r_reach_tensor
         # print("monitor-距離獎勵:", r_reach)
 
         # === 2) 接觸獎勵 ===
@@ -348,12 +367,11 @@ class RoboticEnv(DirectRLEnv):
         self.touch_buf |= touch
         
         # === 2) 抓取獎勵 ===
-        holding = self._check_holding()
-        newly_hold = holding & (~getattr(self, "hold_success_buf", torch.zeros_like(holding)))
-        self.hold_success_buf = holding.clone()
-        r_hold = newly_hold.float() * 200.0
+        grasped = self._check_grasped()
+        self.grasp_success_buf = grasped.clone()
+        r_grasp = grasped.float() * 200.0
 
-        rew = r_reach + r_hold
+        rew = r_reach + r_grasp + r_angle
         # === 狀態記錄 ===
         self.prev_actions = self.actions.clone()
 
@@ -361,13 +379,12 @@ class RoboticEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-    
         self._compute_intermediate()
-        holding = self._check_holding()
+        grasped = self._check_grasped()
         # touching = self._check_touch()
         touching = False
 
-        success = holding | touching
+        success = grasped | touching
 
         done = time_out | success
         return done, time_out
@@ -378,11 +395,16 @@ class RoboticEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # initialize monitors
-        # if not self.monitor_initized:
-        #     for mon in self.monitor:
-        #         mon.initialize()
-        #     print("PoseMonitor initialized.")
-        #     self.monitor_initized = True
+        if not self.monitor_initized:
+            for mon in self.monitor:
+                mon.initialize()
+
+            print("PoseMonitor initialized.")
+            self.monitor_initized = True
+        
+        # reset montitors
+        for i in env_ids:
+            self.monitor[i].reset_holding_confirmation()
 
         # set the root state for the reset envs
         default_root_state = self.robot.data.default_root_state[env_ids]
@@ -421,10 +443,10 @@ class RoboticEnv(DirectRLEnv):
         ep_touch = self.touch_buf[env_ids].int()
         self.episode_touch_count[env_ids] = ep_touch
 
-        self._hold_frame_count[env_ids] = 0
-        self.hold_buf[env_ids] = False
-        if hasattr(self, "hold_success_buf"):
-            self.hold_success_buf[env_ids] = False
+        self._grasp_frame_count[env_ids] = 0
+        self.grasp_buf[env_ids] = False
+        if hasattr(self, "grasp_success_buf"):
+            self.grasp_success_buf[env_ids] = False
 
         # 更新全域統計（Python int）
         self.total_episodes += int(len(env_ids))
@@ -442,3 +464,26 @@ class RoboticEnv(DirectRLEnv):
         # (B) your global running success rate
         success_rate = 0.0 if self.total_episodes == 0 else (self.total_touches / self.total_episodes)
         self.extras["log"]["touch_rate"] = torch.tensor(success_rate, device=self.device, dtype=torch.float32)
+
+def quat_mul(q1, q2):
+    # q1, q2: (..., 4) in (w, x, y, z)
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=-1)
+
+def quat_conj(q):
+    # (w, x, y, z)
+    return torch.stack([q[..., 0], -q[..., 1], -q[..., 2], -q[..., 3]], dim=-1)
+
+def quat_angle_error(q1, q2):
+    """
+    Rotation angle between q1 and q2 (radians), in [0, pi]
+    """
+    q_diff = quat_mul(quat_conj(q1), q2)
+    w = torch.clamp(q_diff[..., 0].abs(), max=1.0)
+    return 2.0 * torch.acos(w)

@@ -12,13 +12,31 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
 
-from isaacsim.core.prims import SingleArticulation, SingleXFormPrim
+import numpy as np
+import torch
+import isaacsim.core.utils.stage as stage_utils
+import omni.physics.tensors.impl.api as physx
+from pxr import UsdPhysics
+from isaacsim.core.prims import SingleArticulation
 
 from .array_backend import mathops as mo
 from .grasp_config import PosePq
 
 
 __all__ = ["ArticulationObserver", "RobotJointConfig"]
+
+try:
+    from isaacsim.core.api.simulation_context.simulation_context import SimulationContext
+except Exception:  # pragma: no cover
+    SimulationContext = None
+
+
+def _quat_xyzw_to_wxyz(quat):
+    """Convert quaternion from xyzw to wxyz (supports torch tensors and numpy arrays)."""
+    if isinstance(quat, torch.Tensor):
+        return quat[..., (3, 0, 1, 2)]
+    quat_arr = np.asarray(quat)
+    return quat_arr[..., (3, 0, 1, 2)]
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +125,10 @@ class ArticulationObserver:
             name=self._name,
         )
 
-        # End-effector TF_1 prim (initialized later)
-        self._ee_tf1_prim_path: Optional[str] = None
-        self._ee_tf1_xform: Optional[SingleXFormPrim] = None
+        # PhysX tensor views (initialized later)
+        self._physics_sim_view = None
+        self._root_physx_view = None
+        self._tf1_link_index: Optional[int] = None
 
         # Joint index caches (populated after initialize)
         self._arm_joint_indices: Optional[List[int]] = None
@@ -143,12 +162,12 @@ class ArticulationObserver:
     @property
     def num_dof(self) -> int:
         """Total number of degrees of freedom."""
-        return self._articulation.num_dof
+        return int(self._root_physx_view.shared_metatype.dof_count)
 
     @property
     def dof_names(self) -> List[str]:
         """List of all DOF names."""
-        return list(self._articulation.dof_names)
+        return list(self._root_physx_view.shared_metatype.dof_names)
 
     @property
     def arm_joint_names(self) -> List[str]:
@@ -183,36 +202,71 @@ class ArticulationObserver:
         # Initialize articulation
         self._articulation.initialize(physics_sim_view)
 
+        # Create PhysX tensor articulation view (hard-coded root prim suffix)
+        root_joint_path = f"{self._prim_path.rstrip('/')}/root_joint"
+        stage = stage_utils.get_current_stage()
+        prim = stage.GetPrimAtPath(root_joint_path)
+        if not prim.IsValid():
+            raise RuntimeError(
+                f"[{self._name}] Invalid articulation root prim: '{root_joint_path}'. "
+                "Expected robot prim path to have a '/root_joint' child."
+            )
+        if not prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            raise RuntimeError(
+                f"[{self._name}] Prim '{root_joint_path}' is not an articulation root "
+                "(missing UsdPhysics.ArticulationRootAPI)."
+            )
+
+        if (
+            physics_sim_view is not None
+            and hasattr(physics_sim_view, "create_articulation_view")
+            and hasattr(physics_sim_view, "update_articulations_kinematic")
+        ):
+            self._physics_sim_view = physics_sim_view
+        else:
+            backend = "torch"
+            if SimulationContext is not None:
+                ctx = SimulationContext.instance()
+                ctx_backend = getattr(ctx, "backend", None)
+                if ctx_backend is not None:
+                    backend = str(ctx_backend).strip().lower()
+            if backend not in ("torch", "numpy"):
+                backend = "torch"
+            self._physics_sim_view = physx.create_simulation_view(backend)
+            self._physics_sim_view.set_subspace_roots("/")
+
+        root_joint_expr = root_joint_path.replace(".*", "*")
+        self._root_physx_view = self._physics_sim_view.create_articulation_view(root_joint_expr)
+        if getattr(self._root_physx_view, "_backend", None) is None:
+            raise RuntimeError(f"[{self._name}] Failed to create PhysX articulation view for '{root_joint_expr}'.")
+
+        # Cache TF_1 link index from PhysX metadata
+        tf1_name = str(self._config.end_effector_tf1_prim_suffix).strip("/").split("/")[-1]
+        link_names = list(self._root_physx_view.shared_metatype.link_names)
+        if tf1_name not in link_names:
+            raise RuntimeError(f"[{self._name}] Link '{tf1_name}' not found. Available links: {link_names}")
+        self._tf1_link_index = link_names.index(tf1_name)
+
         # Build joint index caches
-        dof_names = list(self._articulation.dof_names)
+        dof_names = list(self._root_physx_view.shared_metatype.dof_names)
         print(f"[{self._name}] Available DOFs: {dof_names}")
 
         self._arm_joint_indices = []
         for jname in self._config.arm_joint_names:
-            if jname in dof_names:
-                self._arm_joint_indices.append(dof_names.index(jname))
-            else:
-                print(f"[{self._name}] Warning: Arm joint '{jname}' not found in articulation")
+            if jname not in dof_names:
+                raise RuntimeError(
+                    f"[{self._name}] Arm joint '{jname}' not found in articulation DOFs: {dof_names}"
+                )
+            self._arm_joint_indices.append(dof_names.index(jname))
 
         self._gripper_joint_indices = []
         for jname in self._config.gripper_joint_names:
-            if jname in dof_names:
-                self._gripper_joint_indices.append(dof_names.index(jname))
-            else:
-                print(f"[{self._name}] Warning: Gripper joint '{jname}' not found in articulation")
+            if jname not in dof_names:
+                raise RuntimeError(
+                    f"[{self._name}] Gripper joint '{jname}' not found in articulation DOFs: {dof_names}"
+                )
+            self._gripper_joint_indices.append(dof_names.index(jname))
 
-        print(f"[{self._name}] Arm joint indices: {self._arm_joint_indices}")
-        print(f"[{self._name}] Gripper joint indices: {self._gripper_joint_indices}")
-
-        root_path = self._prim_path.rstrip("/")
-        tf1_suffix = str(self._config.end_effector_tf1_prim_suffix).strip("/")
-        if not tf1_suffix:
-            raise ValueError("end_effector_tf1_prim_suffix cannot be empty.")
-        self._ee_tf1_prim_path = f"{root_path}/{tf1_suffix}"
-        self._ee_tf1_xform = SingleXFormPrim(
-            prim_path=self._ee_tf1_prim_path,
-            name=f"{self._name}_ee_tf1",
-        )
 
         self._initialized = True
         print(f"[{self._name}] ArticulationObserver initialized successfully")
@@ -224,24 +278,24 @@ class ArticulationObserver:
 
     def get_joint_positions(self) -> Any:
         """Get all joint positions."""
-        return self._articulation.get_joint_positions()
+        self._physics_sim_view.update_articulations_kinematic()
+        positions = self._root_physx_view.get_dof_positions()
+        return positions[0]
 
     def get_joint_velocities(self) -> Any:
         """Get all joint velocities."""
-        return self._articulation.get_joint_velocities()
+        self._physics_sim_view.update_articulations_kinematic()
+        velocities = self._root_physx_view.get_dof_velocities()
+        return velocities[0]
 
     def get_arm_joint_positions(self) -> Any:
         """Get arm joint positions (7-DOF)."""
-        if self._arm_joint_indices is None:
-            raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
-        all_positions = self._articulation.get_joint_positions()
+        all_positions = self.get_joint_positions()
         return all_positions[self._arm_joint_indices]
 
     def get_arm_joint_velocities(self) -> Any:
         """Get arm joint velocities (7-DOF)."""
-        if self._arm_joint_indices is None:
-            raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
-        all_velocities = self._articulation.get_joint_velocities()
+        all_velocities = self.get_joint_velocities()
         return all_velocities[self._arm_joint_indices]
 
     def get_gripper_joint_positions(self) -> Any:
@@ -253,16 +307,12 @@ class ArticulationObserver:
             - Slider9: range [0, 0.05], positive = open
             - Slider10: range [-0.05, 0], negative = open
         """
-        if self._gripper_joint_indices is None:
-            raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
-        all_positions = self._articulation.get_joint_positions()
+        all_positions = self.get_joint_positions()
         return all_positions[self._gripper_joint_indices]
 
     def get_gripper_joint_velocities(self) -> Any:
         """Get gripper joint velocities."""
-        if self._gripper_joint_indices is None:
-            raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
-        all_velocities = self._articulation.get_joint_velocities()
+        all_velocities = self.get_joint_velocities()
         return all_velocities[self._gripper_joint_indices]
 
     # -----------------------------------------------------------------------
@@ -284,13 +334,21 @@ class ArticulationObserver:
             - p: 3D position in world frame
             - q: quaternion in wxyz format
         """
-        if self._ee_tf1_xform is None:
-            raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
-
-        tf1_pos, tf1_quat = self._ee_tf1_xform.get_world_pose()
+        self._physics_sim_view.update_articulations_kinematic()
+        poses = self._root_physx_view.get_link_transforms()
+        tf1_pose = poses[0, self._tf1_link_index]
+        tf1_pos = tf1_pose[:3]
+        tf1_quat = _quat_xyzw_to_wxyz(tf1_pose[3:7])
         tf1_rot = mo.quat_to_rot_matrix(tf1_quat)
 
-        ee_offset = mo.asarray(self._config.tf1_to_grasp_center_offset)
+        if isinstance(tf1_pos, torch.Tensor):
+            ee_offset = torch.as_tensor(
+                self._config.tf1_to_grasp_center_offset,
+                device=tf1_pos.device,
+                dtype=tf1_pos.dtype,
+            )
+        else:
+            ee_offset = np.asarray(self._config.tf1_to_grasp_center_offset, dtype=np.float32)
         ee_pos = tf1_pos + tf1_rot @ ee_offset
         return PosePq(ee_pos, tf1_quat)
 
@@ -366,4 +424,8 @@ class ArticulationObserver:
             Tuple of (position, orientation) where orientation is quaternion (wxyz).
             Backend depends on SimulationContext (numpy ndarray or torch Tensor).
         """
-        return self._articulation.get_world_pose()
+        self._physics_sim_view.update_articulations_kinematic()
+        pose = self._root_physx_view.get_root_transforms()
+        pos = pose[0, :3]
+        quat = _quat_xyzw_to_wxyz(pose[0, 3:7])
+        return pos, quat

@@ -20,7 +20,7 @@ ASSET_DIR = REPO_ROOT / "Robotic"
 class RoboticEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 20.0
+    episode_length_s = 10.0
     # - spaces definition
     action_space = 4
     observation_space = 19

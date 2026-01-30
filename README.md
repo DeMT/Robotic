@@ -113,9 +113,12 @@
   | Name       | formula                           | scale | Description                                                 |
   | ---------- | --------------------------------- | ----- | ----------------------------------------------------------- |
   | r_reach    |  \|\|ee_pos - fan_pos\|\|         | -1    | Distance error between the end-effector gripper and the fan |
+  | r_grasp    | 𝟙[grasp_confirmed]                | 200   | Sparse reward when the fan is successfully grasped and held |
+
 
 - Success Matrix
 
   | Name       | formula                           | Description                                                 |
   | ---------- | --------------------------------- | ----------------------------------------------------------- |
   | s_reach    |  \|\|ee_pos - fan_pos\|\| < 0.15  | Whether the end-effector gripper is close enough to the fan |
+  | s_grasp    | grasp_confirmed                   | Whether the fan is successfully grasped and held    |
